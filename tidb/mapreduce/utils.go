@@ -8,6 +8,12 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"unsafe"
+)
+
+const (
+	offset64 uint64 = 14695981039346656037
+	prime64         = 1099511628211
 )
 
 // RoundArgs contains arguments used in a map-reduce round.
@@ -114,4 +120,19 @@ func SafeClose(f *os.File, buf *bufio.Writer) {
 func FileOrDirExist(p string) bool {
 	_, err := os.Stat(p)
 	return err == nil
+}
+
+// String provides a cheaper way to convert []byte to string
+func String(b []byte) string {
+	return *(*string)(unsafe.Pointer(&b))
+}
+
+// fnvHash64 is ported from go library, which is thread-safe.
+func fnvHash64(data []byte) int {
+	hash := offset64
+	for _, c := range data {
+		hash *= prime64
+		hash ^= uint64(c)
+	}
+	return int(hash & 0x7fffffffffffffff)
 }

@@ -2,15 +2,16 @@ package main
 
 import (
 	"bufio"
-	"encoding/json"
+	"fmt"
 	"hash/fnv"
-	"io/ioutil"
 	"log"
 	"os"
 	"path"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
+	//	logger "github.com/logrus"
 )
 
 // KeyValue is a type used to hold the key/value pairs passed to the map and reduce functions.
@@ -36,13 +37,13 @@ const (
 type task struct {
 	dataDir    string
 	jobName    string
-	mapFile    string   // only for map, the input file
-	phase      jobPhase // are we in mapPhase or reducePhase?
-	taskNumber int      // this task's index in the current phase
-	nMap       int      // number of map tasks
-	nReduce    int      // number of reduce tasks
-	mapF       MapF     // map function used in this job
-	reduceF    ReduceF  // reduce function used in this job
+	mapFile    string   
+	phase      jobPhase 
+	taskNumber int      
+	nMap       int      
+	nReduce    int      
+	mapF       MapF     
+	reduceF    ReduceF  
 	wg         sync.WaitGroup
 }
 
@@ -82,14 +83,40 @@ func (c *MRCluster) Start() {
 
 func (c *MRCluster) worker() {
 	defer c.wg.Done()
+	content := make([]byte, 0)
+	reduceOut := make([]byte, 0)
 	for {
 		select {
 		case t := <-c.taskCh:
 			if t.phase == mapPhase {
-				content, err := ioutil.ReadFile(t.mapFile)
+				//	logger.WithFields(logger.Fields{
+				//		"jobName":    t.jobName,
+				//		"phase":      t.phase,
+				//		"taskNumber": t.taskNumber,
+				//		"mapFile":    t.mapFile,
+				//		"nReduce":    t.nReduce,
+				//	}).Info("[Map]worker doing a task")
+
+				fm, err := os.Open(t.mapFile)
 				if err != nil {
 					panic(err)
 				}
+				bm := bufio.NewReader(fm)
+
+				fi, err := fm.Stat()
+				if err != nil {
+					panic(err)
+				}
+				size := int(fi.Size())
+				if size > len(content) {
+					content = append(content, make([]byte, size-len(content), size-len(content))...)
+				} else {
+					content = content[:size]
+				}
+
+				bm.Read(content)
+
+				fm.Close()
 
 				fs := make([]*os.File, t.nReduce)
 				bs := make([]*bufio.Writer, t.nReduce)
@@ -97,20 +124,104 @@ func (c *MRCluster) worker() {
 					rpath := reduceName(t.dataDir, t.jobName, t.taskNumber, i)
 					fs[i], bs[i] = CreateFileAndBuf(rpath)
 				}
-				results := t.mapF(t.mapFile, string(content))
+				results := t.mapF(t.mapFile, String(content))
+
+				var k string
+				var v string
 				for _, kv := range results {
-					enc := json.NewEncoder(bs[ihash(kv.Key)%t.nReduce])
-					if err := enc.Encode(&kv); err != nil {
-						log.Fatalln(err)
-					}
+					k = strings.Trim(kv.Key, ",")
+					v = strings.Trim(kv.Value, ",")
+
+					bs[fnvHash64([]byte(kv.Key))%t.nReduce].WriteString(fmt.Sprintf("%v,%v\n", k, v))
 				}
 				for i := range fs {
 					SafeClose(fs[i], bs[i])
 				}
 			} else {
 				// YOUR CODE HERE :)
-				panic("YOUR CODE HERE")
+				//  panic("YOUR CODE HERE")
+				// reducePhase
+				//		logger.WithFields(logger.Fields{
+				//			"jobName":    t.jobName,
+				//			"phase":      t.phase,
+				//			"taskNumber": t.taskNumber,
+				//			"nReduce":    t.nReduce,
+				//		}).Info("[Reduce]worker doing a task")
+
+				// interData -- the input of reduceF
+				interData := make(map[string][]string)
+				for i := 0; i < t.nMap; i++ {
+					reduceInfile := reduceName(t.dataDir, t.jobName, i, t.taskNumber)
+					fs, err := os.Open(reduceInfile)
+					if err != nil {
+						panic(err)
+					}
+					bs := bufio.NewReader(fs)
+					// read the whole map file into content
+					fi, err := fs.Stat()
+					if err != nil {
+						panic(err)
+					}
+					size := int(fi.Size())
+					if size > len(content) {
+						content = append(content, make([]byte, size-len(content), size-len(content))...)
+					} else {
+						content = content[:size]
+					}
+					bs.Read(content)
+
+					// parse content into key-values and append values with the same key to interdata[key]
+					start := 0
+					comma := 0
+					var k string
+					var v string
+					for i := 0; i < len(content); i++ {
+						if content[i] == 0x2c {
+							comma = i
+							if start == comma {
+								k = ""
+							} else {
+								k = string(content[start:comma])
+							}
+						}
+						if content[i] == 0x0a {
+							v = string(content[comma+1 : i])
+							start = i + 1
+							interData[k] = append(interData[k], v)
+						}
+
+					}
+					fs.Close()
+				}
+
+				//reduceOut -- the res of reducePhase
+				reduceOut = reduceOut[:0]
+				for k, v := range interData {
+					reduceOut = append(reduceOut, []byte(t.reduceF(k, v))...)
+				}
+				//		logger.WithFields(logger.Fields{
+				//			"jobName":    t.jobName,
+				//			"phase":      t.phase,
+				//			"taskNumber": t.taskNumber,
+				//			"nReduce":    t.nReduce,
+				//		}).Info("[Reduce] get outputData with reduceF works fine")
+
+				// write res to disk
+				reduceOutFile := mergeName(t.dataDir, t.jobName, t.taskNumber)
+				fs, bs := CreateFileAndBuf(reduceOutFile)
+				if _, err := bs.Write(reduceOut); err != nil {
+					log.Fatalln(err)
+				}
+				SafeClose(fs, bs)
+				//		logger.WithFields(logger.Fields{
+				//			"jobName":    t.jobName,
+				//			"phase":      t.phase,
+				//			"taskNumber": t.taskNumber,
+				//			"nReduce":    t.nReduce,
+				//		}).Info("[Reduce] write outputdata to disk done")
+
 			}
+
 			t.wg.Done()
 		case <-c.exit:
 			return
@@ -135,6 +246,11 @@ func (c *MRCluster) run(jobName, dataDir string, mapF MapF, reduceF ReduceF, map
 	// map phase
 	nMap := len(mapFiles)
 	tasks := make([]*task, 0, nMap)
+	//	logger.WithFields(logger.Fields{
+	//		"jobName": jobName,
+	//		"nReduce": nReduce,
+	//	}).Info("MRC.run() receives a new job")
+
 	for i := 0; i < nMap; i++ {
 		t := &task{
 			dataDir:    dataDir,
@@ -154,9 +270,48 @@ func (c *MRCluster) run(jobName, dataDir string, mapF MapF, reduceF ReduceF, map
 		t.wg.Wait()
 	}
 
-	// reduce phase
-	// YOUR CODE HERE :D
-	panic("YOUR CODE HERE")
+	//	logger.WithFields(logger.Fields{
+	//		"jobName": jobName,
+	//		"nMap":    nMap,
+	//		"nReduce": nReduce,
+	//	}).Info("MRC.run() finished mapPhase")
+	//	 reduce phase
+	//	 YOUR CODE HERE :D
+	//	  panic("YOUR CODE HERE")
+	reduceTasks := make([]*task, 0, nReduce)
+	for i := 0; i < nReduce; i++ {
+		t := &task{
+			dataDir:    dataDir,
+			jobName:    jobName,
+			phase:      reducePhase,
+			taskNumber: i,
+			nReduce:    nReduce,
+			nMap:       nMap,
+			reduceF:    reduceF,
+		}
+		t.wg.Add(1)
+		reduceTasks = append(reduceTasks, t)
+		go func() { c.taskCh <- t }()
+	}
+	for _, t := range reduceTasks {
+		t.wg.Wait()
+	}
+
+	// reduce phase done, notify the position of the output files
+	outputs := make([]string, 0)
+	for i := 0; i < nReduce; i++ {
+		outputs = append(outputs, mergeName(dataDir, jobName, i))
+	}
+
+	//	logger.WithFields(logger.Fields{
+	//		"jobName": jobName,
+	//		"nMap":    nMap,
+	//		"nReduce": nReduce,
+	//		//      "outputFile": outputs,
+	//	}).Info("MRC.run() finished reducePhase, return")
+
+	go func() { notify <- outputs }()
+	return
 }
 
 func ihash(s string) int {
