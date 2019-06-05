@@ -73,7 +73,7 @@ func (hj *hashJoin) init(f0, f1 string) {
 	var recSpliter []byte
 	switch runtime.GOOS {
 	case "darwin":
-		recSpliter = []byte{0x0d}
+		recSpliter = []byte{0x0a}
 	case "windows":
 		recSpliter = []byte{0x0a, 0x0d}
 	case "linux":
